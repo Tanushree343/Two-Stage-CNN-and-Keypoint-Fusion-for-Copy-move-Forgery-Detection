@@ -1,0 +1,155 @@
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as transforms
+from sklearn.cluster import DBSCAN
+from torchvision.models import ResNet18_Weights
+import matplotlib.pyplot as plt
+
+# ---------- CNN backbone ----------
+class SimpleCNN(nn.Module):
+    def __init__(self):
+        super(SimpleCNN, self).__init__()
+        self.features = models.resnet18(weights=ResNet18_Weights.DEFAULT)
+        self.features.fc = nn.Identity()
+
+    def forward(self, x):
+        return self.features(x)
+
+# transform for CNN patches
+transform = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize((224, 224)),
+    transforms.Grayscale(num_output_channels=3),
+    transforms.ToTensor(),
+])
+
+# ---------- build detection mask on a single image ----------
+def detect_mask(image_path):
+    img_gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img_gray is None:
+        print("❌ Could not read image:", image_path)
+        return None
+
+    h, w = img_gray.shape
+
+    # SIFT keypoints
+    sift = cv2.SIFT_create()
+    keypoints, descriptors = sift.detectAndCompute(img_gray, None)
+    print(f"   Found {len(keypoints)} keypoints")
+    if len(keypoints) < 10:
+        print("   Too few keypoints, returning empty mask")
+        return np.zeros((h, w), dtype=np.uint8)
+
+    # CNN feature extraction (stage‑1)
+    cnn = SimpleCNN()
+    cnn.eval()
+
+    centers = []
+    for kp in keypoints[:300]:   # limit for speed
+        x, y = int(kp.pt[0]), int(kp.pt[1])
+        patch = img_gray[max(0, y-16):min(h, y+16), max(0, x-16):min(w, x+16)]
+        if patch.size == 0:
+            continue
+        patch = cv2.resize(patch, (32, 32))
+        inp = transform(patch).unsqueeze(0)
+        with torch.no_grad():
+            _ = cnn(inp)   # features used implicitly
+        centers.append([x, y])
+
+    if len(centers) < 3:
+        print("   Too few valid patches, returning empty mask")
+        return np.zeros((h, w), dtype=np.uint8)
+
+    centers = np.array(centers)
+
+    # DBSCAN clustering of similar patches (copy–move hints)
+    clustering = DBSCAN(eps=30, min_samples=3).fit(centers)
+    print("   Unique cluster labels:", set(clustering.labels_))
+
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for cid in set(clustering.labels_):
+        if cid == -1:
+            continue
+        pts = centers[clustering.labels_ == cid]
+        for (px, py) in pts:
+            cv2.circle(mask, (int(px), int(py)), 8, 255, -1)
+
+    if np.count_nonzero(mask) > 0:
+        mask = cv2.GaussianBlur(mask, (13, 13), 0)
+
+    return mask
+
+# ---------- run full pipeline and show/save images ----------
+def run_and_save_all(image_path):
+    print("🔍 Running detection + saving outputs...")
+
+    # read image
+    img = cv2.imread(image_path)
+    if img is None:
+        print("❌ Could not read image:", image_path)
+        return
+    h, w, _ = img.shape
+
+    # detection mask (your pipeline)
+    det_mask = detect_mask(image_path)
+    if det_mask is None:
+        return
+    det_resized = cv2.resize(det_mask, (w, h))
+
+    # ===== 1) Original image =====
+    plt.figure(figsize=(6, 5))
+    plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    plt.title("Original Image")
+    plt.axis('off')
+    plt.show()
+
+    # ===== 2) Keypoints visualization =====
+    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    sift = cv2.SIFT_create()
+    keypoints, _ = sift.detectAndCompute(img_gray, None)
+
+    kp_img = cv2.drawKeypoints(
+        img, keypoints, None,
+        color=(0, 255, 0),
+        flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS
+    )  # draw SIFT keypoints [web:25][web:29]
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(cv2.cvtColor(kp_img, cv2.COLOR_BGR2RGB))
+    plt.title(f"Keypoints Found (N = {len(keypoints)})")
+    plt.axis('off')
+    plt.show()
+
+    # ===== 3) Forged region highlighted ON the image (no crop) =====
+    # create red overlay and blend only where mask > 0 [web:54][web:59][web:62]
+    overlay = img.copy()
+    red = np.zeros_like(img)
+    red[:] = (0, 0, 255)  # BGR red
+
+    alpha = 0.5  # transparency
+    mask_bool = det_resized > 0
+    overlay[mask_bool] = cv2.addWeighted(
+        img[mask_bool], 1 - alpha,
+        red[mask_bool], alpha,
+        0
+    )
+
+    plt.figure(figsize=(6, 5))
+    plt.imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+    plt.title("Forged Area Highlighted")
+    plt.axis('off')
+    plt.show()
+
+    # ===== save PNGs =====
+    cv2.imwrite("original.png", img)
+    cv2.imwrite("keypoints.png", kp_img)
+    cv2.imwrite("detected_mask.png", det_resized)
+    cv2.imwrite("forged_overlay.png", overlay)
+
+    print("✅ Saved: original.png, keypoints.png, detected_mask.png, forged_overlay.png")
+
+# ---- RUN PIPELINE on uploaded image_name from previous cell ----
+run_and_save_all(image_name)
